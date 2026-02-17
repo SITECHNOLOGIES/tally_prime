@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from test import TallyDataExtractor
+from utils import TallyDataExtractor
 
 # ============================================================================
 # CONFIG
