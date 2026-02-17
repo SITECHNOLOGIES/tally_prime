@@ -1,0 +1,390 @@
+{
+  "info": {
+    "name": "TruGenie - Tally Prime Integration API",
+    "description": "REST API for extracting data from Tally Prime.\n\nPrimary: XML API | Fallback: ODBC\n\nBase URL: http://localhost:8001\nSwagger: http://localhost:8001/docs",
+    "_postman_id": "trugenie-tally-api-v1",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8001",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health & Config",
+      "item": [
+        {
+          "name": "Root - API Info",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/",
+            "description": "Basic API info and links"
+          }
+        },
+        {
+          "name": "Health Check (XML + ODBC)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health",
+            "description": "Check Tally connectivity via both XML API and ODBC. Shows status of each method."
+          }
+        },
+        {
+          "name": "Switch Company",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/config/switch-company?company_name=TruGenie&force_odbc=false",
+              "host": ["{{base_url}}"],
+              "path": ["config", "switch-company"],
+              "query": [
+                { "key": "company_name", "value": "TruGenie", "description": "Company name in Tally" },
+                { "key": "tally_url", "value": "http://localhost:9000", "description": "Tally server URL (optional)", "disabled": true },
+                { "key": "force_odbc", "value": "false", "description": "Force ODBC mode" }
+              ]
+            },
+            "description": "Switch to a different company or force ODBC mode for testing"
+          }
+        },
+        {
+          "name": "Switch to ODBC Mode (Test)",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/config/switch-company?company_name=TruGenie&force_odbc=true",
+              "host": ["{{base_url}}"],
+              "path": ["config", "switch-company"],
+              "query": [
+                { "key": "company_name", "value": "TruGenie" },
+                { "key": "force_odbc", "value": "true" }
+              ]
+            },
+            "description": "Force ODBC pathway - use this to test ODBC fallback independently"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Company",
+      "item": [
+        {
+          "name": "Get All Companies",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/companies",
+            "description": "List all companies loaded in Tally"
+          }
+        },
+        {
+          "name": "Get Company Info",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/company/info",
+            "description": "Current company details - name, address, GSTIN, PAN, phone, email"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Ledgers",
+      "item": [
+        {
+          "name": "Get All Ledgers",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/ledgers",
+              "host": ["{{base_url}}"],
+              "path": ["ledgers"],
+              "query": [
+                { "key": "refresh", "value": "false", "description": "Force refresh cache", "disabled": true }
+              ]
+            },
+            "description": "All ledgers with balances, GSTIN, PAN, etc. Cached for 5 minutes."
+          }
+        },
+        {
+          "name": "Get All Ledgers (Force Refresh)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/ledgers?refresh=true",
+            "description": "Bypass cache and fetch fresh data from Tally"
+          }
+        },
+        {
+          "name": "Search Ledger by Name",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/ledgers/search?name=HDFC Bank Current Account",
+              "host": ["{{base_url}}"],
+              "path": ["ledgers", "search"],
+              "query": [
+                { "key": "name", "value": "HDFC Bank Current Account", "description": "Ledger name (case-insensitive)" }
+              ]
+            },
+            "description": "Search for a specific ledger by exact name"
+          }
+        },
+        {
+          "name": "Ledgers by Group - Sundry Debtors",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/ledgers/group/Sundry Debtors",
+            "description": "All ledgers in a parent group"
+          }
+        },
+        {
+          "name": "Ledgers by Group - Sundry Creditors",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/ledgers/group/Sundry Creditors"
+          }
+        },
+        {
+          "name": "Ledgers by Group - Indirect Expenses",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/ledgers/group/Indirect Expenses"
+          }
+        },
+        {
+          "name": "Bank Accounts",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/ledgers/bank-accounts",
+            "description": "All bank account ledgers"
+          }
+        },
+        {
+          "name": "Cash Accounts",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/ledgers/cash-accounts",
+            "description": "All cash-in-hand ledgers"
+          }
+        },
+        {
+          "name": "Fixed Assets",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/ledgers/fixed-assets",
+            "description": "All fixed asset ledgers"
+          }
+        },
+        {
+          "name": "Loans (Secured + Unsecured)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/ledgers/loans",
+            "description": "All secured and unsecured loan ledgers"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Debtors & Creditors",
+      "item": [
+        {
+          "name": "All Debtors (Receivables)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/debtors",
+            "description": "All sundry debtors with total receivables"
+          }
+        },
+        {
+          "name": "Top 5 Debtors",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/debtors/top?limit=5",
+            "description": "Top debtors by outstanding balance"
+          }
+        },
+        {
+          "name": "Top 10 Debtors",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/debtors/top?limit=10"
+          }
+        },
+        {
+          "name": "All Creditors (Payables)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/creditors",
+            "description": "All sundry creditors with total payables"
+          }
+        },
+        {
+          "name": "Top 5 Creditors",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/creditors/top?limit=5",
+            "description": "Top creditors by outstanding balance"
+          }
+        },
+        {
+          "name": "Top 10 Creditors",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/creditors/top?limit=10"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Vouchers",
+      "item": [
+        {
+          "name": "All Vouchers (Full FY)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/vouchers",
+            "description": "All vouchers for the current financial year"
+          }
+        },
+        {
+          "name": "Vouchers - Filtered by Type & Date",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/vouchers?voucher_type=Sales&from_date=20250401&to_date=20250630&limit=100",
+              "host": ["{{base_url}}"],
+              "path": ["vouchers"],
+              "query": [
+                { "key": "voucher_type", "value": "Sales", "description": "Sales, Purchase, Receipt, Payment, Journal, Contra" },
+                { "key": "from_date", "value": "20250401", "description": "Start date YYYYMMDD" },
+                { "key": "to_date", "value": "20250630", "description": "End date YYYYMMDD" },
+                { "key": "limit", "value": "100", "description": "Max records" }
+              ]
+            },
+            "description": "Filter vouchers by type and/or date range"
+          }
+        },
+        {
+          "name": "Sales Vouchers",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/vouchers/sales",
+            "description": "All sales invoices"
+          }
+        },
+        {
+          "name": "Purchase Vouchers",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/vouchers/purchases",
+            "description": "All purchase invoices"
+          }
+        },
+        {
+          "name": "Receipt Vouchers",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/vouchers/receipts",
+            "description": "All receipts (money received)"
+          }
+        },
+        {
+          "name": "Payment Vouchers",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/vouchers/payments",
+            "description": "All payments (money paid)"
+          }
+        },
+        {
+          "name": "Journal Vouchers",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/vouchers/journals",
+            "description": "All journal entries (depreciation, adjustments, etc.)"
+          }
+        },
+        {
+          "name": "Day Book - Today",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/vouchers/daybook",
+            "description": "All vouchers for today"
+          }
+        },
+        {
+          "name": "Day Book - Specific Date",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/vouchers/daybook?date=20250415",
+            "description": "All vouchers for April 15, 2025"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Masters",
+      "item": [
+        {
+          "name": "All Account Groups",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/groups",
+            "description": "All account groups (Sundry Debtors, Bank Accounts, etc.)"
+          }
+        },
+        {
+          "name": "Cost Centres (Projects)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/cost-centres",
+            "description": "All cost centres / projects"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Reports",
+      "item": [
+        {
+          "name": "Financial Summary",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/reports/financial-summary",
+            "description": "Key metrics: total assets, liabilities, receivables, payables, bank balance, loans, fixed assets"
+          }
+        },
+        {
+          "name": "Group-wise Summary",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/reports/group-summary",
+            "description": "Ledger count and balance totals per account group"
+          }
+        },
+        {
+          "name": "Trial Balance",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/reports/trial-balance",
+            "description": "Trial balance with debit/credit totals and balance check"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Export",
+      "item": [
+        {
+          "name": "Full Data Export",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/export/all",
+            "description": "Complete data export - company info, groups, ledgers, cost centres, vouchers, trial balance, financial summary. Takes 30-60 seconds."
+          }
+        }
+      ]
+    }
+  ]
+}
