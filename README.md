@@ -139,8 +139,8 @@ For this project, the default company name is `Nimona`. Change it in the config 
 ### 2.1 Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/tally-integration-api.git
-cd tally-integration-api
+git clone https://github.com/SITECHNOLOGIES/tally_prime.git
+cd tally_prime
 ```
 
 ### 2.2 Create Virtual Environment (Recommended)
