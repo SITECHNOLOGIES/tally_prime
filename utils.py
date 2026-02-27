@@ -1,24 +1,3 @@
-"""
-Tally Prime Data Extraction Functions for API Development
-==========================================================
-
-Primary: XML API over HTTP  |  Fallback: ODBC (Tally ODBC Driver)
-
-CRITICAL FIX (Feb 16, 2026 - v4):
-- Voucher extraction: 
-  * Export Data (TALLYREQUEST=Export Data) → returns import dialog prompt (BROKEN)
-  * Collection + NATIVEMETHOD=* → 1.3MB with invalid XML chars (BROKEN)  
-  * Collection + NATIVEMETHOD=specific fields → 169KB, works perfectly! (USED)
-  FIX: Use TYPE=Collection with NATIVEMETHOD listing specific fields.
-  
-- Company info: Added COLLECTION binding (was missing, caused empty response)
-
-Author: Nimona Sarraf
-Date: February 13, 2026
-Updated: February 17, 2026 v4 (Collection Export for vouchers)
-Purpose: POC - Nimona Integration (Real Estate Client)
-"""
-
 import requests
 import xml.etree.ElementTree as ET
 import re
@@ -71,6 +50,11 @@ class ExtractionMethod(str, Enum):
     ODBC = "odbc"
 
 
+class TallyConnectionError(Exception):
+    """Raised when no connection method is available to Tally."""
+    pass
+
+
 # ============================================================================
 # MAIN EXTRACTOR CLASS
 # ============================================================================
@@ -79,27 +63,29 @@ class TallyDataExtractor:
     """
     Comprehensive Tally Prime data extractor.
     Primary: XML API over HTTP  |  Fallback: ODBC via pyodbc
-    
+
     KEY INSIGHT on Tally XML API:
-    
+
     There are THREE ways to get data from Tally via XML:
-    
+
     1. TDL Reports (custom reports via <TDL><TDLMESSAGE><REPORT>):
        - Works great for: Ledgers, Groups, Cost Centres, Company list
-       - FAILS for voucher amounts because $Amount is not directly 
+       - FAILS for voucher amounts because $Amount is not directly
          accessible on Voucher collection in flat TDL report context.
-    
+
     2. Export Data (<TALLYREQUEST>Export Data</TALLYREQUEST>):
        - BROKEN: Returns an import dialog prompt on this Tally version
        - May work on other Tally versions/configurations
-    
+
     3. Collection Export (<TYPE>Collection</TYPE> + <NATIVEMETHOD>):
        - WORKS for vouchers! Returns VOUCHER objects with all nested data.
        - Key: use specific NATIVEMETHOD fields (not *) to avoid
          1MB+ responses with invalid XML character references.
        - Returns: VoucherNumber, VoucherTypeName, Date, Amount,
          PartyLedgerName, Narration, AllLedgerEntries
-    
+       - NOTE: Tally may ignore SVFROMDATE/SVTODATE for collection exports.
+         We apply date filtering in Python after fetching (see get_vouchers).
+
     This module uses approach #1 for ledgers/groups and #3 for vouchers.
     """
 
@@ -192,6 +178,19 @@ class TallyDataExtractor:
             except ValueError:
                 continue
 
+        return date_str
+
+    @staticmethod
+    def _normalize_date_param(date_str: str) -> str:
+        """
+        Normalize a date parameter (YYYYMMDD or YYYY-MM-DD) to YYYY-MM-DD
+        for consistent Python-side comparisons.
+        """
+        if not date_str:
+            return ""
+        date_str = date_str.strip()
+        if re.match(r'^\d{8}$', date_str):
+            return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
         return date_str
 
     @staticmethod
@@ -321,18 +320,25 @@ class TallyDataExtractor:
             "odbc": {"connected": False, "companies": [], "error": None},
             "active_method": None,
         }
-        if not self.force_odbc:
-            try:
-                companies = self._xml_get_company_list()
-                if companies:
-                    result["xml_api"]["connected"] = True
-                    result["xml_api"]["companies"] = companies
+
+        # Always test XML API regardless of force_odbc so callers can make
+        # informed fallback decisions (e.g. switch-company fallback logic).
+        try:
+            companies = self._xml_get_company_list()
+            if companies:
+                result["xml_api"]["connected"] = True
+                result["xml_api"]["companies"] = companies
+                if not self.force_odbc:
+                    # Only set xml_api as active method if not in force_odbc mode
                     result["active_method"] = "xml_api"
                     logger.info("XML API: OK (%d companies)", len(companies))
                 else:
-                    result["xml_api"]["error"] = "No companies returned"
-            except Exception as exc:
-                result["xml_api"]["error"] = str(exc)
+                    logger.info("XML API: OK (%d companies) [force_odbc=True, not using as primary]", len(companies))
+            else:
+                result["xml_api"]["error"] = "No companies returned"
+        except Exception as exc:
+            result["xml_api"]["error"] = str(exc)
+
         try:
             companies = self._odbc_get_company_list()
             if companies:
@@ -344,7 +350,19 @@ class TallyDataExtractor:
                 result["odbc"]["error"] = "No companies returned or pyodbc not installed"
         except Exception as exc:
             result["odbc"]["error"] = str(exc)
+
+        # If force_odbc but ODBC failed, active_method is still None here.
+        # The switch-company endpoint handles the fallback from there.
         return result
+
+    def is_connected(self) -> bool:
+        """Quick check: returns True if at least one connection method works."""
+        if not self.force_odbc:
+            xml_companies = self._xml_get_company_list()
+            if xml_companies:
+                return True
+        odbc_companies = self._odbc_get_company_list()
+        return bool(odbc_companies)
 
     # ========================================================================
     # COMPANY INFORMATION
@@ -381,11 +399,24 @@ class TallyDataExtractor:
             return []
 
     def get_company_list(self) -> List[str]:
+        """
+        Returns list of companies. Raises TallyConnectionError if Tally is unreachable
+        and ODBC is also unavailable.
+        """
         if not self.force_odbc:
             result = self._xml_get_company_list()
             if result:
                 return result
-        return self._odbc_get_company_list() or []
+
+        odbc_result = self._odbc_get_company_list()
+        if odbc_result:
+            return odbc_result
+
+        # Both methods failed — raise so the API layer can return a proper error
+        raise TallyConnectionError(
+            "Cannot connect to Tally. XML API and ODBC both unavailable. "
+            "Please ensure Tally Prime is running and accessible."
+        )
 
     def get_company_info(self) -> Dict:
         """
@@ -435,8 +466,9 @@ class TallyDataExtractor:
             "phone": "", "email": "", "gstin": "", "pan": "", "books_from": "",
         }
         if not xml_resp:
-            info["company_name"] = self.company_name
-            return info
+            raise TallyConnectionError(
+                "Cannot connect to Tally. Please ensure Tally Prime is running."
+            )
         try:
             root = ET.fromstring(xml_resp)
             tag_map = {
@@ -477,7 +509,9 @@ class TallyDataExtractor:
             ledgers = self._odbc_get_ledgers()
         if ledgers is None:
             logger.error("Both XML API and ODBC failed for ledgers")
-            return []
+            raise TallyConnectionError(
+                "Cannot connect to Tally. XML API and ODBC both unavailable."
+            )
 
         self._ledger_cache = ledgers
         self._cache_time = time.time()
@@ -622,7 +656,7 @@ class TallyDataExtractor:
         </ENVELOPE>"""
         xml_resp = self._execute_request(xml_request)
         if not xml_resp:
-            return []
+            raise TallyConnectionError("Cannot connect to Tally.")
         try:
             root = ET.fromstring(xml_resp)
             groups, cur = [], {}
@@ -669,7 +703,7 @@ class TallyDataExtractor:
         </ENVELOPE>"""
         xml_resp = self._execute_request(xml_request)
         if not xml_resp:
-            return []
+            raise TallyConnectionError("Cannot connect to Tally.")
         try:
             root = ET.fromstring(xml_resp)
             centres, cur = [], {}
@@ -687,26 +721,19 @@ class TallyDataExtractor:
     # ========================================================================
     # VOUCHER FUNCTIONS - Uses Collection Export (TYPE=Collection)
     # ========================================================================
-    # 
-    # WHY NOT TDL Reports: $Amount, $PartyLedgerName return empty/0
-    # WHY NOT Export Data: Returns import dialog prompt (broken on this Tally)
-    # WHY NOT NATIVEMETHOD=*: Returns 1.3MB with invalid XML char refs
     #
-    # SOLUTION: Collection Export with specific NATIVEMETHOD fields:
-    #   <TYPE>Collection</TYPE>
-    #   <NATIVEMETHOD>VoucherNumber, VoucherTypeName, Date, 
-    #                 Amount, PartyLedgerName, Narration</NATIVEMETHOD>
-    #   <NATIVEMETHOD>AllLedgerEntries</NATIVEMETHOD>
-    #
-    # Returns 169KB with 59+ clean VOUCHER elements including:
-    #   VOUCHERNUMBER, VOUCHERTYPENAME, DATE, AMOUNT, 
-    #   PARTYLEDGERNAME, NARRATION, ALLLEDGERENTRIES.LIST
+    # NOTE ON DATE FILTERING:
+    # Tally's Collection export often ignores SVFROMDATE/SVTODATE and returns
+    # all vouchers regardless of the date range set in STATICVARIABLES.
+    # To ensure correct results, we ALWAYS apply Python-side date filtering
+    # after fetching. The XML date params are still sent as a hint to Tally,
+    # but we never rely solely on them.
     # ========================================================================
 
     def _parse_voucher_element(self, vch_elem) -> Dict:
         """
         Parse a single <VOUCHER> XML element into a dict.
-        
+
         Tally Export Data XML structure:
         <VOUCHER VCHTYPE="Sales" REMOTEID="...">
             <DATE>20250401</DATE>
@@ -725,17 +752,10 @@ class TallyDataExtractor:
                 <AMOUNT>5500000.00</AMOUNT>    ← positive = credit entry
             </ALLLEDGERENTRIES.LIST>
         </VOUCHER>
-        
+
         AMOUNT sign convention in Tally Export:
           Negative amount = Debit entry  (ISDEEMEDPOSITIVE=Yes)
           Positive amount = Credit entry (ISDEEMEDPOSITIVE=No)
-        
-        Day Book "Particulars" mapping:
-          Payment:  first ledger entry (party/expense being debited)
-          Receipt:  first ledger entry (bank being debited)
-          Sales:    party ledger name (debtor)
-          Purchase: party ledger name (creditor)
-          Journal:  first ledger entry (expense being debited)
         """
         vch = {
             "voucher_number": "",
@@ -772,7 +792,6 @@ class TallyDataExtractor:
                     if e_tag == "LEDGERNAME":
                         entry["ledger_name"] = e_val
                     elif e_tag == "AMOUNT":
-                        # Tally Export: negative = debit, positive = credit
                         raw_amt = 0.0
                         try:
                             raw_amt = float(e_val.replace(",", ""))
@@ -780,38 +799,24 @@ class TallyDataExtractor:
                             pass
                         entry["raw_amount"] = raw_amt
                         entry["amount"] = abs(raw_amt)
-                        # Negative = Debit entry, Positive = Credit entry
                         entry["dr_cr"] = "Dr" if raw_amt < 0 else "Cr"
                     elif e_tag == "ISDEEMEDPOSITIVE":
                         entry["is_debit"] = e_val.lower() in ("yes", "true")
                 if entry:
                     vch["ledger_entries"].append(entry)
 
-        # ----------------------------------------------------------------
-        # Calculate voucher amount:
-        # Sum of all DEBIT entries (negative amounts in Tally = debit)
-        # This matches the "Debit Amount" column in Tally Day Book
-        # ----------------------------------------------------------------
         debit_entries = [e for e in vch["ledger_entries"] if e.get("raw_amount", 0) < 0]
         credit_entries = [e for e in vch["ledger_entries"] if e.get("raw_amount", 0) > 0]
-
-        # Voucher total = sum of debit side (absolute values)
         debit_total = sum(abs(e.get("raw_amount", 0)) for e in debit_entries)
         credit_total = sum(abs(e.get("raw_amount", 0)) for e in credit_entries)
         vch["amount"] = debit_total or credit_total
 
-        # ----------------------------------------------------------------
-        # Particulars: matches Tally Day Book "Particulars" column
-        # Day Book shows the FIRST ledger entry's name
-        # ----------------------------------------------------------------
         if vch["ledger_entries"]:
             vch["particulars"] = vch["ledger_entries"][0].get("ledger_name", "")
 
-        # If party_name is empty, use particulars
         if not vch["party_name"] and vch["particulars"]:
             vch["party_name"] = vch["particulars"]
 
-        # Clean up raw_amount from entries before returning
         for entry in vch["ledger_entries"]:
             entry.pop("raw_amount", None)
 
@@ -827,27 +832,19 @@ class TallyDataExtractor:
     ) -> List[Dict]:
         """
         Get vouchers using Collection Export with NATIVEMETHOD.
-        
-        IMPORTANT: We use TYPE=Collection with NATIVEMETHOD (not Export Data).
-        
-        Tested approaches and results:
-        - Export Data + REPORTNAME=Vouchers → returns import dialog (FAILS)
-        - Export Data + REPORTNAME=Day Book → 2MB response with invalid XML chars (FAILS)
-        - Collection + NATIVEMETHOD=* → 1.3MB, invalid XML chars (FAILS)
-        - Collection + NATIVEMETHOD=specific fields → 169KB, 59 VOUCHER elements (WORKS!)
-        
-        The working format returns:
-          <VOUCHER VCHTYPE="Sales">
-            <VOUCHERNUMBER>19</VOUCHERNUMBER>
-            <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
-            <PARTYLEDGERNAME TYPE="String">Godrej Properties Limited</PARTYLEDGERNAME>
-            <NARRATION TYPE="String">PMC charges...</NARRATION>
-            <AMOUNT TYPE="Amount">-5500000.00</AMOUNT>
-            <ALLLEDGERENTRIES.LIST>...</ALLLEDGERENTRIES.LIST>
-          </VOUCHER>
+
+        IMPORTANT: Tally may ignore SVFROMDATE/SVTODATE in collection exports.
+        We always apply Python-side date filtering after fetching to guarantee
+        correct results regardless of Tally version behavior.
+
+        Date params accept YYYYMMDD or YYYY-MM-DD format.
         """
         fd = from_date or self.fy_start
         td = to_date or self.fy_end
+
+        # Normalise to YYYY-MM-DD for Python-side comparisons
+        filter_from = self._normalize_date_param(fd)
+        filter_to = self._normalize_date_param(td)
 
         xml_request = f"""
         <ENVELOPE>
@@ -869,7 +866,7 @@ class TallyDataExtractor:
                         <TDLMESSAGE>
                             <COLLECTION NAME="VchCollection">
                                 <TYPE>Voucher</TYPE>
-                                <NATIVEMETHOD>VoucherNumber, VoucherTypeName, Date, 
+                                <NATIVEMETHOD>VoucherNumber, VoucherTypeName, Date,
                                               Amount, PartyLedgerName, Narration</NATIVEMETHOD>
                                 <NATIVEMETHOD>AllLedgerEntries</NATIVEMETHOD>
                             </COLLECTION>
@@ -881,15 +878,15 @@ class TallyDataExtractor:
 
         xml_resp = self._execute_request(xml_request, timeout=120)
         if not xml_resp:
-            logger.warning("Voucher collection export failed")
-            return []
+            logger.warning("Voucher collection export failed — no response from Tally")
+            raise TallyConnectionError(
+                "Cannot connect to Tally. Please ensure Tally Prime is running."
+            )
 
         try:
             root = ET.fromstring(xml_resp)
         except ET.ParseError as exc:
             logger.error("XML parse error (vouchers): %s", exc)
-            # The response may contain invalid XML character references
-            # Try cleaning more aggressively
             try:
                 cleaned = re.sub(r'&#x[0-9a-fA-F]+;', '', xml_resp)
                 cleaned = re.sub(r'&#\d+;', '', cleaned)
@@ -900,17 +897,32 @@ class TallyDataExtractor:
                 return []
 
         vouchers = []
+        skipped_date = 0
+        skipped_type = 0
+
         for vch_elem in root.iter("VOUCHER"):
             vch = self._parse_voucher_element(vch_elem)
 
             if not vch["voucher_number"]:
                 continue
 
+            # ----------------------------------------------------------------
+            # Python-side date filtering (Tally XML date params are unreliable)
+            # ----------------------------------------------------------------
+            vch_date = vch.get("date", "")  # Already YYYY-MM-DD from parse_tally_date
+            if vch_date:
+                if filter_from and vch_date < filter_from:
+                    skipped_date += 1
+                    continue
+                if filter_to and vch_date > filter_to:
+                    skipped_date += 1
+                    continue
+
             # Filter by voucher type if specified
             if voucher_type and vch.get("voucher_type", "").lower() != voucher_type.lower():
+                skipped_type += 1
                 continue
 
-            # Remove ledger_entries from response unless requested
             if not include_entries:
                 vch.pop("ledger_entries", None)
 
@@ -920,8 +932,9 @@ class TallyDataExtractor:
                 break
 
         logger.info(
-            "Extracted %d vouchers (type=%s, %s to %s) via %s",
-            len(vouchers), voucher_type or "ALL", fd, td, self._method.value,
+            "Extracted %d vouchers (type=%s, %s to %s) | skipped_date=%d skipped_type=%d | via %s",
+            len(vouchers), voucher_type or "ALL", filter_from, filter_to,
+            skipped_date, skipped_type, self._method.value,
         )
         return vouchers
 
@@ -967,9 +980,15 @@ class TallyDataExtractor:
         return self.get_vouchers("Debit Note", from_date, to_date)
 
     def get_day_book(self, date: Optional[str] = None) -> List[Dict]:
-        """Get all vouchers for a date."""
+        """
+        Get all vouchers for a specific date (Day Book).
+        Date defaults to today if not provided.
+        Both from_date and to_date are set to the same date to ensure
+        only that day's vouchers are returned.
+        """
         if not date:
             date = datetime.now().strftime("%Y%m%d")
+        # Pass the same date as both from and to — enforced by Python-side filter
         return self.get_vouchers(from_date=date, to_date=date)
 
     # ========================================================================
@@ -1104,107 +1123,14 @@ def example_usage():
     ledgers = extractor.get_all_ledgers()
     print(f"  Total: {len(ledgers)}")
 
-    # Day Book format - matches Tally screenshot
-    print("\n4. Day Book for 1-Apr-25 (matching Tally screenshot)...")
-    print("-" * 110)
-    print(f"{'Date':<12} {'Particulars':<45} {'Vch Type':<12} {'Vch No.':>8} {'Debit Amount':>16}")
-    print("-" * 110)
-    
+    # Day Book
+    print("\n4. Day Book for 1-Apr-25...")
     daybook = extractor.get_day_book("20250401")
-    
-    # Sort by type order: Payment, Receipt, Journal, Sales, Purchase (matching Tally)
-    type_order = {"Payment": 0, "Receipt": 1, "Journal": 2, "Sales": 3, "Purchase": 4}
-    daybook.sort(key=lambda v: (type_order.get(v.get("voucher_type", ""), 9), 
-                                 int(v.get("voucher_number", "0") or "0")))
-    
-    for v in daybook:
-        date_str = v.get("date", "").replace("-", "/") if v.get("date") else ""
-        # Use Indian number format like Tally
-        amt = v.get("amount", 0)
-        if amt >= 10000000:  # 1 crore+
-            amt_str = f"{amt/10000000:,.2f} Cr"
-        else:
-            amt_str = f"{amt:>14,.2f}"
-        
-        print(f"{date_str:<12} {v.get('particulars', v.get('party_name', '')):<45} "
-              f"{v.get('voucher_type', ''):<12} {v.get('voucher_number', ''):>8} {amt_str:>16}")
-    
-    print("-" * 110)
-    print(f"Total vouchers on 1-Apr-25: {len(daybook)}")
-    
-    # Summary by type
-    from collections import defaultdict
-    by_type = defaultdict(lambda: {"count": 0, "total": 0})
-    for v in daybook:
-        t = v.get("voucher_type", "Other")
-        by_type[t]["count"] += 1
-        by_type[t]["total"] += v.get("amount", 0)
-    
-    print("\nSummary:")
-    for t in ["Payment", "Receipt", "Journal", "Sales", "Purchase"]:
-        if t in by_type:
-            print(f"  {t:<12}: {by_type[t]['count']:>3} vouchers = ₹{by_type[t]['total']:>14,.2f}")
+    print(f"  Vouchers on 2025-04-01: {len(daybook)}")
 
-    # Expected values from screenshot
-    print("\n5. Verification against Tally Day Book screenshot...")
-    expected = {
-        "Payment": {"count": 12, "total": 30750000},
-        "Receipt": {"count": 8, "total": 48600000},
-        "Journal": {"count": 3, "total": 10500000},
-    }
-    
-    all_ok = True
-    for vtype, exp in expected.items():
-        actual = by_type.get(vtype, {"count": 0, "total": 0})
-        count_ok = actual["count"] == exp["count"]
-        total_ok = abs(actual["total"] - exp["total"]) < 1
-        status = "✅" if (count_ok and total_ok) else "❌"
-        print(f"  {status} {vtype}: count={actual['count']}/{exp['count']} "
-              f"total=₹{actual['total']:,.0f}/₹{exp['total']:,.0f}")
-        if not (count_ok and total_ok):
-            all_ok = False
-    
-    if all_ok:
-        print("\n  ✅ ALL AMOUNTS MATCH TALLY DAY BOOK!")
-    else:
-        print("\n  ⚠️  Some mismatches - check voucher details")
-
-    # All vouchers
-    print("\n6. All vouchers (full FY)...")
-    all_vch = extractor.get_vouchers(limit=200)
-    print(f"  Total: {len(all_vch)}")
-
-    # Sales detail
-    print("\n7. Sales vouchers...")
-    sales = extractor.get_sales_vouchers()
-    print(f"  Count: {len(sales)}, Total: ₹{sum(v['amount'] for v in sales):,.2f}")
-    for v in sales[:5]:
-        print(f"  Vch#{v['voucher_number']:>4} | {v['date']} | ₹{v['amount']:>14,.2f} | {v['party_name']}")
-
-    # Payment detail  
-    print("\n8. Payment vouchers...")
-    payments = extractor.get_payment_vouchers()
-    print(f"  Count: {len(payments)}, Total: ₹{sum(v['amount'] for v in payments):,.2f}")
-    for v in payments[:5]:
-        print(f"  Vch#{v['voucher_number']:>4} | {v['date']} | ₹{v['amount']:>14,.2f} | {v['particulars']}")
-
-    # Voucher with entries
-    print("\n9. Detailed voucher (first Sales with entries)...")
-    detailed = extractor.get_vouchers_with_entries(voucher_type="Sales", limit=1)
-    if detailed:
-        v = detailed[0]
-        print(f"  Vch#{v['voucher_number']} | {v['voucher_type']} | {v['date']} | ₹{v['amount']:,.2f}")
-        print(f"  Party: {v['party_name']}")
-        print(f"  Narration: {v['narration']}")
-        print(f"  Ledger entries:")
-        for e in v.get("ledger_entries", []):
-            side = "Dr" if e.get("is_debit") else "Cr"
-            print(f"    {side}: {e.get('ledger_name', ''):<40} ₹{e.get('amount', 0):>14,.2f}")
-
-    print(f"\n10. Extraction method: {extractor.get_extraction_method()}")
+    print(f"\n5. Extraction method: {extractor.get_extraction_method()}")
     print("=" * 110)
     print("DONE!")
-
 
 
 if __name__ == "__main__":
