@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from utils import TallyDataExtractor
+from utils import TallyDataExtractor, TallyConnectionError
 
 # ============================================================================
 # CONFIG
@@ -72,14 +72,17 @@ async def lifespan(app: FastAPI):
     ext = get_extractor()
     conn = ext.test_connection()
     method = conn.get("active_method", "none")
-    logger.info("Startup connection: %s", method)
+    if not method:
+        logger.warning("Startup: No connection to Tally (XML API and ODBC both unavailable).")
+    else:
+        logger.info("Startup connection: %s", method)
     yield
     logger.info("Shutting down.")
 
 app = FastAPI(
     title="TruGenie - Tally Prime Integration API",
     description="REST API for Tally Prime data extraction. Vouchers use Export Data format.",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -98,7 +101,11 @@ def api_response(data, count=None):
 
 def handle_error(exc, context):
     logger.exception("Error in %s: %s", context, exc)
-    return JSONResponse(status_code=500, content=APIResponse(success=False, error=f"{context}: {str(exc)}").model_dump())
+    status = 503 if isinstance(exc, TallyConnectionError) else 500
+    return JSONResponse(
+        status_code=status,
+        content=APIResponse(success=False, error=f"{context}: {str(exc)}").model_dump(),
+    )
 
 # ============================================================================
 # HEALTH & CONFIG
@@ -106,7 +113,7 @@ def handle_error(exc, context):
 
 @app.get("/", tags=["Health"])
 async def root():
-    return {"api": "TruGenie Tally Integration", "version": "1.2.0", "docs": "/docs"}
+    return {"api": "TruGenie Tally Integration", "version": "1.3.0", "docs": "/docs"}
 
 @app.get("/health", tags=["Health"])
 async def health_check():
@@ -121,12 +128,57 @@ async def health_check():
 
 @app.post("/config/switch-company", tags=["Config"])
 async def switch_company(
-    company_name: str = Query(...), tally_url: Optional[str] = Query(None),
+    company_name: str = Query(...),
+    tally_url: Optional[str] = Query(None),
     force_odbc: bool = Query(False),
 ):
+    """
+    Switch the active Tally company.
+
+    - If force_odbc=true but ODBC is unavailable, automatically falls back
+      to XML API so other endpoints continue to work without a server restart.
+    - Returns connected=false with a clear warning if neither method works.
+    """
     ext = reset_extractor(company_name=company_name, url=tally_url, force_odbc=force_odbc)
     conn = ext.test_connection()
-    return {"success": True, "company": company_name, "connected": bool(conn["active_method"])}
+    active = conn.get("active_method")
+    used_fallback = False
+
+    # If force_odbc was requested but ODBC failed, fall back to XML API.
+    # We always do this unconditionally — test_connection now always tests
+    # XML even when force_odbc=True, so xml_api["connected"] is reliable here.
+    if force_odbc and not conn["odbc"]["connected"]:
+        logger.warning(
+            "force_odbc=True but ODBC unavailable for company=%s — falling back to XML API",
+            company_name,
+        )
+        ext = reset_extractor(company_name=company_name, url=tally_url, force_odbc=False)
+        conn = ext.test_connection()
+        active = conn.get("active_method")
+        used_fallback = True
+
+    response = {
+        "success": True,
+        "company": company_name,
+        "connected": bool(active),
+        "active_method": active,
+        "xml_api": conn["xml_api"],
+        "odbc": conn["odbc"],
+    }
+
+    if used_fallback:
+        response["warning"] = (
+            "ODBC was requested but is unavailable. "
+            "Automatically switched to XML API."
+        )
+
+    if not active:
+        response["warning"] = (
+            "Could not connect to Tally via XML API or ODBC. "
+            "Please ensure Tally Prime is running and accessible."
+        )
+
+    return response
 
 # ============================================================================
 # COMPANY
@@ -134,9 +186,24 @@ async def switch_company(
 
 @app.get("/companies", tags=["Company"])
 async def get_companies():
+    """
+    Returns the list of companies open in Tally.
+    Returns HTTP 503 with a clear error message if Tally is not running.
+    """
     try:
         companies = get_extractor().get_company_list()
         return api_response(companies, count=len(companies))
+    except TallyConnectionError as exc:
+        # Tally is offline — return 503 Service Unavailable, not 200 with empty data
+        return JSONResponse(
+            status_code=503,
+            content=APIResponse(
+                success=False,
+                error=str(exc),
+                data=None,
+                count=0,
+            ).model_dump(),
+        )
     except Exception as exc:
         return handle_error(exc, "get_companies")
 
@@ -144,6 +211,11 @@ async def get_companies():
 async def get_company_info():
     try:
         return api_response(get_extractor().get_company_info())
+    except TallyConnectionError as exc:
+        return JSONResponse(
+            status_code=503,
+            content=APIResponse(success=False, error=str(exc)).model_dump(),
+        )
     except Exception as exc:
         return handle_error(exc, "get_company_info")
 
@@ -230,17 +302,22 @@ async def get_top_creditors(limit: int = Query(10, ge=1, le=100)):
     except Exception as exc: return handle_error(exc, "get_top_creditors")
 
 # ============================================================================
-# VOUCHERS - Now uses Export Data format (returns real amounts!)
+# VOUCHERS
 # ============================================================================
 
 @app.get("/vouchers", tags=["Vouchers"])
 async def get_vouchers(
     voucher_type: Optional[str] = Query(None, description="Sales, Purchase, Receipt, Payment, Journal, Contra"),
-    from_date: Optional[str] = Query(None, description="YYYYMMDD"),
-    to_date: Optional[str] = Query(None, description="YYYYMMDD"),
+    from_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
     limit: int = Query(500, ge=1, le=10000),
 ):
-    """Get vouchers with amount, party name, narration. Uses Tally Export Data format."""
+    """
+    Get vouchers filtered by type and/or date range.
+
+    Date filtering is enforced in Python (not just passed to Tally XML) to
+    guarantee correctness regardless of Tally version behavior.
+    """
     try:
         vouchers = get_extractor().get_vouchers(
             voucher_type=voucher_type, from_date=from_date, to_date=to_date, limit=limit,
@@ -252,8 +329,8 @@ async def get_vouchers(
 @app.get("/vouchers/details", tags=["Vouchers"])
 async def get_voucher_details(
     voucher_type: Optional[str] = Query(None),
-    from_date: Optional[str] = Query(None, description="YYYYMMDD"),
-    to_date: Optional[str] = Query(None, description="YYYYMMDD"),
+    from_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
     limit: int = Query(200, ge=1, le=5000),
 ):
     """Get vouchers WITH line-item Dr/Cr ledger entries."""
@@ -266,50 +343,75 @@ async def get_voucher_details(
         return handle_error(exc, "get_voucher_details")
 
 @app.get("/vouchers/sales", tags=["Vouchers"])
-async def get_sales_vouchers(from_date: Optional[str] = Query(None), to_date: Optional[str] = Query(None)):
+async def get_sales_vouchers(
+    from_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+):
     try: return api_response(get_extractor().get_sales_vouchers(from_date, to_date))
     except Exception as exc: return handle_error(exc, "get_sales_vouchers")
 
 @app.get("/vouchers/purchases", tags=["Vouchers"])
-async def get_purchase_vouchers(from_date: Optional[str] = Query(None), to_date: Optional[str] = Query(None)):
+async def get_purchase_vouchers(
+    from_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+):
     try: return api_response(get_extractor().get_purchase_vouchers(from_date, to_date))
     except Exception as exc: return handle_error(exc, "get_purchase_vouchers")
 
 @app.get("/vouchers/receipts", tags=["Vouchers"])
-async def get_receipt_vouchers(from_date: Optional[str] = Query(None), to_date: Optional[str] = Query(None)):
+async def get_receipt_vouchers(
+    from_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+):
     try: return api_response(get_extractor().get_receipt_vouchers(from_date, to_date))
     except Exception as exc: return handle_error(exc, "get_receipt_vouchers")
 
 @app.get("/vouchers/payments", tags=["Vouchers"])
-async def get_payment_vouchers(from_date: Optional[str] = Query(None), to_date: Optional[str] = Query(None)):
+async def get_payment_vouchers(
+    from_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+):
     try: return api_response(get_extractor().get_payment_vouchers(from_date, to_date))
     except Exception as exc: return handle_error(exc, "get_payment_vouchers")
 
 @app.get("/vouchers/journals", tags=["Vouchers"])
-async def get_journal_vouchers(from_date: Optional[str] = Query(None), to_date: Optional[str] = Query(None)):
+async def get_journal_vouchers(
+    from_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+):
     try: return api_response(get_extractor().get_journal_vouchers(from_date, to_date))
     except Exception as exc: return handle_error(exc, "get_journal_vouchers")
 
 @app.get("/vouchers/daybook", tags=["Vouchers"])
-async def get_day_book(date: Optional[str] = Query(None, description="YYYYMMDD, defaults to today")):
+async def get_day_book(
+    date: Optional[str] = Query(
+        None,
+        description="Specific date in YYYYMMDD or YYYY-MM-DD format. Defaults to today.",
+    ),
+):
     """
     Get all vouchers for a specific date (Day Book).
-    Returns vouchers with 'particulars' field matching Tally Day Book column.
+
+    - If `date` is omitted, today's date is used.
+    - Only vouchers whose date exactly matches the requested date are returned.
+      Date filtering is enforced in Python to guarantee correct results.
     """
     try:
         ext = get_extractor()
         vouchers = ext.get_day_book(date)
-        
-        # Calculate summary by type
+
         from collections import defaultdict
         by_type = defaultdict(lambda: {"count": 0, "total": 0.0})
         for v in vouchers:
             t = v.get("voucher_type", "Other")
             by_type[t]["count"] += 1
             by_type[t]["total"] += v.get("amount", 0)
-        
+
+        # Resolve the actual date used (get_day_book defaults to today)
+        resolved_date = date if date else datetime.now().strftime("%Y-%m-%d")
+
         return api_response({
-            "date": date or "today",
+            "date": resolved_date,
             "vouchers": vouchers,
             "total_vouchers": len(vouchers),
             "summary_by_type": dict(by_type),
@@ -346,7 +448,10 @@ async def get_group_summary():
     except Exception as exc: return handle_error(exc, "get_group_summary")
 
 @app.get("/reports/trial-balance", tags=["Reports"])
-async def get_trial_balance(from_date: Optional[str] = Query(None), to_date: Optional[str] = Query(None)):
+async def get_trial_balance(
+    from_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
+):
     try:
         tb = get_extractor().get_trial_balance(from_date, to_date)
         total_dr = sum(e.get("debit", 0) for e in tb)
@@ -402,7 +507,7 @@ async def debug_raw_voucher_xml(
                     <TDLMESSAGE>
                         <COLLECTION NAME="DebugVchColl">
                             <TYPE>Voucher</TYPE>
-                            <NATIVEMETHOD>VoucherNumber, VoucherTypeName, Date, 
+                            <NATIVEMETHOD>VoucherNumber, VoucherTypeName, Date,
                                           Amount, PartyLedgerName, Narration</NATIVEMETHOD>
                             <NATIVEMETHOD>AllLedgerEntries</NATIVEMETHOD>
                         </COLLECTION>
@@ -415,7 +520,6 @@ async def debug_raw_voucher_xml(
     if raw:
         return PlainTextResponse(raw[:20000], media_type="application/xml")
     return PlainTextResponse("No response from Tally", status_code=502)
-
 
 
 if __name__ == "__main__":
